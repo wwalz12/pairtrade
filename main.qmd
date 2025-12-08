@@ -1,0 +1,249 @@
+---
+author: William Walz 
+date: November 12, 2025 
+---
+### KO/PEP Pairs Trading: Spread, Z-Score, and Strategy
+
+This plot visualizes the log spread between KO and PEP, the corresponding rolling Z-score used to detect mean-reversion opportunities, and the cumulative returns from a simple long–short pairs trading strategy. The goal is to determine whether deviations from the historical KO-PEP price relationship typically revert and can be traded profitably or reliably.
+
+*Load required packages for data, time-series transformation, and visualization.*
+
+```{r}
+library(yahoofinancer)
+library(tidyverse)
+library(TTR)
+library(lubridate)
+library(glue)
+library(patchwork)
+```
+
+*Fetch/clean KO and PEP closing prices from Yahoo Finance as clean numeric time series.*
+
+```{r}
+fetch_data <- function(ticker1, ticker2, start_date, end_date) {
+  message(glue::glue("Fetching data for {ticker1} and {ticker2} from {start_date} to {end_date}..."))
+  
+  t1 <- Ticker$new(ticker1)
+  t2 <- Ticker$new(ticker2)
+  
+d1 <- t1$get_history(start = start_date, end = end_date, interval = "1d") |>
+  as_tibble() |>
+  select(date, !!ticker1 := adj_close) |>
+  mutate(across(all_of(ticker1), ~ as.numeric(.)))
+
+d2 <- t2$get_history(start = start_date, end = end_date, interval = "1d") |>
+  as_tibble() |>
+  select(date, !!ticker2 := adj_close) |>
+  mutate(across(all_of(ticker2), ~ as.numeric(.)))
+  
+  data <- inner_join(d1, d2, by = "date") |>
+    arrange(date) |>
+    drop_na()
+  
+  data
+  
+}
+```
+
+*Compute log spread between the two assets and standardize it into a rolling Z-score for mean-reversion analysis.*
+
+```{r}
+calculate_spread_zscore <- function(data, ticker1, ticker2, window = 30) {
+  price1 <- data[[ticker1]]
+  price2 <- data[[ticker2]]
+  
+log_price1 <- log(price1)
+log_price2 <- log(price2)
+  
+spread <- log_price1 - log_price2
+  
+rolling_mean <- runMean(spread, n = window)
+rolling_std  <- runSD(spread,  n = window)
+  
+z_score <- (spread - rolling_mean) / rolling_std
+  
+tibble(
+  date = data$date,
+  spread = spread,
+  z_score = z_score,
+  rolling_mean = rolling_mean,
+  rolling_std  = rolling_std
+  )
+}
+```
+
+*Generate trading signals based on Z-score thresholds using a simple long/short rule.*
+
+```{r}
+generate_signals <- function(z_score,
+                             entry_threshold = 2.0,
+                             exit_threshold  = 0.0) {
+  # Positions: 1 = Long Spread (long A, short B)
+  #           -1 = Short Spread (short A, long B)
+  #            0 = Flat
+  
+n <- length(z_score)
+positions <- integer(n)
+current_position <- 0L
+  
+for (i in seq_len(n)) {
+  z <- z_score[i]
+    
+    if (is.na(z)) {
+      positions[i] <- current_position
+      next
+    }
+    
+    if (current_position == 0L) {
+      if (z < -entry_threshold) {
+        current_position <- 1L  # Long Spread
+      } else if (z > entry_threshold) {
+        current_position <- -1L # Short Spread
+      }
+    } else if (current_position == 1L) {
+      if (z >= -exit_threshold) {  # same logic as Python
+        current_position <- 0L
+      }
+    } else if (current_position == -1L) {
+      if (z <= exit_threshold) {
+        current_position <- 0L
+      }
+    }
+    
+    positions[i] <- current_position
+  }
+  
+  positions
+}
+```
+
+*Backtest the trading rule by computing daily returns and compounding them into overall performance.*
+
+```{r}
+backtest <- function(data, positions, ticker1, ticker2) {
+  # simple close-to-close returns
+ret1 <- data[[ticker1]] / dplyr::lag(data[[ticker1]]) - 1
+ret2 <- data[[ticker2]] / dplyr::lag(data[[ticker2]]) - 1
+  
+  # shift positions by one day to avoid look-ahead
+lagged_positions <- dplyr::lag(positions, 1, default = 0)
+  
+  # strategy return: position * (ret1 - ret2)
+strategy_returns <- lagged_positions * (ret1 - ret2)
+  
+  # first value is NA because of lag; treat as 0 return
+strategy_returns[is.na(strategy_returns)] <- 0
+  
+cumulative_returns <- cumprod(1 + strategy_returns)
+  
+list(
+  strategy_returns   = strategy_returns,
+  cumulative_returns = cumulative_returns
+  )
+}
+```
+
+*Plot the spread, Z-score, and strategy returns.*
+
+```{r}
+plot_results <- function(df, cumulative_returns, ticker1, ticker2) {
+  library(ggplot2)
+  library(glue)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+
+  # keep only rows where the Z-score is defined
+  mask <- !is.na(df$z_score)
+
+  df2 <- df[mask, ] %>%
+    mutate(
+      z_scaled   = (z_score - mean(z_score, na.rm = TRUE)) *
+                   (sd(spread, na.rm = TRUE) / sd(z_score, na.rm = TRUE)) +
+                   mean(spread, na.rm = TRUE),
+      z2_scaled  = ( 2   - mean(z_score, na.rm = TRUE)) *
+                   (sd(spread, na.rm = TRUE) / sd(z_score, na.rm = TRUE)) +
+                   mean(spread, na.rm = TRUE),
+      zm2_scaled = (-2   - mean(z_score, na.rm = TRUE)) *
+                   (sd(spread, na.rm = TRUE) / sd(z_score, na.rm = TRUE)) +
+                   mean(spread, na.rm = TRUE)
+    )
+
+  # align cumulative returns with the same non-NA dates
+  cum2 <- cumulative_returns[mask]
+
+  s_mean <- mean(df2$spread, na.rm = TRUE)
+  s_sd   <- sd(df2$spread,   na.rm = TRUE)
+  z_mean <- mean(df2$z_score, na.rm = TRUE)
+  z_sd   <- sd(df2$z_score,   na.rm = TRUE)
+  scale_factor <- s_sd / z_sd
+
+  # Top panel: spread + z-score (twin axis)
+p_top <- ggplot(df2, aes(x = date)) +
+  geom_line(aes(y = spread), linewidth = 0.5, color = "#4C72B0") +      # blue
+  geom_line(aes(y = z_scaled), linewidth = 0.5, color = "#DD8452") +    # orange
+  geom_hline(aes(yintercept = z2_scaled[1]), 
+             linetype = "dashed", color = "red", alpha = 0.6) +         # +2 red
+  geom_hline(aes(yintercept = zm2_scaled[1]), 
+             linetype = "dashed", color = "darkgreen", alpha = 0.6) +   # -2 green
+  geom_hline(yintercept = s_mean, linetype = "dotted", color = "gray40") +
+  scale_y_continuous(
+    name = "Log Spread",
+    sec.axis = sec_axis(
+      ~ (. - s_mean) / scale_factor + z_mean,
+      name = "Z-Score"
+    )
+  ) +
+  labs(
+    title = glue("{ticker1}/{ticker2} Spread & Z-Score"),
+    x = NULL
+  ) +
+  theme_minimal()
+
+  # Bottom panel: Cumulative P&L
+  df_pnl <- tibble(
+    date = df2$date,
+    cumulative_returns = cum2
+  )
+
+p_bottom <- ggplot(df_pnl, aes(x = date, y = cumulative_returns)) +
+  geom_line(linewidth = 0.7, color = "darkgreen") +                     # green P&L
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Cumulative Strategy Returns",
+    x = NULL,
+    y = "Growth of $1"
+  ) +
+  theme_minimal()
+
+# Stack vertically
+  p_top / p_bottom
+}
+```
+
+*Run the full pipeline—download data, compute spreads, generate signals, backtest the strategy, and visualize results.*
+
+```{r}
+TICKER1 <- "KO"
+TICKER2 <- "PEP"
+
+START_DATE <- Sys.Date() - years(5)
+END_DATE   <- Sys.Date()
+
+data <- fetch_data(TICKER1, TICKER2, START_DATE, END_DATE)
+df_spread <- calculate_spread_zscore(data, TICKER1, TICKER2)
+positions <- generate_signals(df_spread$z_score)
+bt <- backtest(data, positions, TICKER1, TICKER2)
+cumulative_returns <- bt$cumulative_returns
+
+plot_results(df_spread, cumulative_returns, TICKER1, TICKER2)
+```
+**Interpretation**
+
+The top panel shows the log spread (in blue) and the rolling Z-score (in orange), with dashed red and green lines marking the ±2 standard-deviation thresholds typically used for trade entry (Gatev et al., 2006*). When the Z-score moves above +2, the strategy shorts the spread (short KO, long PEP); when it falls below –2, it takes the opposite position. The dotted grey line shows the long-run mean of the spread.
+
+The bottom panel tracks the cumulative P&L of this rule-based strategy. Despite clear oscillations in the Z-score, the cumulative return suffers a significant decline, particularly in the latter half of the sample. This indicates that while KO and PEP move together, their deviations from equilibrium often fail to revert quickly enough to capture a profit. The strategy’s poor performance suggests that the historical co-movement between these consumer staples is insufficient to generate alpha simply through a pairs-trading approach, challenging the assumption that industry peers reliably mean-revert.
+
+**References**
+
+Gatev, E., Goetzmann, W. N., & Rouwenhorst, K. G. (2006). Pairs Trading: Performance of a Relative-Value Arbitrage Rule. The Review of Financial Studies.
