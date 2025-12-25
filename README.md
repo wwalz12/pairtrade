@@ -13,3 +13,5 @@ The goal of this study is to establish whether or not KO and PEP have a predict
 
 ## Key Findings
 The key findings show that, while KO and PEP tend to move together, their price spread does not revert consistently enough to guarantee consistent profitability. Backtesting results show that cumulative returns have been declining steadily, particularly in the sample's later years. Overall, the evidence suggests that even closely related industry peers with similar fundamentals may not show consistent mean reversion in the highly liquid, large-cap US equity markets.
+
+**Report (PDF):** [Download/View](main.pdf)
